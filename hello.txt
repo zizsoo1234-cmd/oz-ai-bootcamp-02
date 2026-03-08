@@ -1,5 +1,0 @@
-<<<<<<< HEAD
-hello, main
-=======
-hello, search
->>>>>>> feature/search
