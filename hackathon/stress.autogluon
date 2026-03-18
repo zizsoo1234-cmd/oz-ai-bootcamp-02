@@ -1,0 +1,99 @@
+# 1. 필수 라이브러리 설치 (필요시)
+# !pip install autogluon
+
+import pandas as pd
+import numpy as np
+from autogluon.tabular import TabularPredictor
+from scipy.stats import skew
+
+# 2. 데이터 로드
+train = pd.read_csv('train.csv')
+test = pd.read_csv('test.csv')
+submission = pd.read_csv('sample_submission.csv')
+
+# 3. Feature Engineering (파생 변수 생성)
+def engineer_features(df):
+    # (1) BMI: 체중(kg) / 키(m)^2
+    df['BMI'] = df['weight'] / ((df['height'] / 100) ** 2)
+
+    # (2) MAP (Mean Arterial Pressure): 평균 혈압
+    # 공식: (systolic + 2 * diastolic) / 3
+    df['MAP'] = (df['systolic_blood_pressure'] + 2 * df['diastolic_blood_pressure']) / 3
+
+    # (3) Medical History Multi-Hot Encoding (핵심 질병 추출)
+    # 질환들이 콤마로 연결되어 있으므로 이를 분리하여 개별 컬럼화
+    for disease in ['diabetes', 'heart disease', 'high blood pressure']:
+        df[f'has_{disease.replace(" ", "_")}'] = df['medical_history'].fillna('').apply(lambda x: 1 if disease in x else 0)
+        df[f'fam_has_{disease.replace(" ", "_")}'] = df['family_medical_history'].fillna('').apply(lambda x: 1 if disease in x else 0)
+
+    # (4) 질병 개수 카운트
+    df['medical_count'] = df['medical_history'].fillna('').apply(lambda x: len(x.split(',')) if x != '' else 0)
+
+    return df
+
+train = engineer_features(train)
+test = engineer_features(test)
+
+# 학습에 사용할 데이터 정리 (ID 제외)
+train_data = train.drop(columns=['ID'])
+test_data = test.drop(columns=['ID'])
+
+# 4. 결측값 처리 전략 (그룹별 채우기 적용)
+def handle_missing_advanced(df):
+    # mean_working이 결측치인 경우 나이대별(10년 단위) 중앙값으로 채움
+    df['age_group'] = (df['age'] // 10) * 10
+    df['mean_working'] = df['mean_working'].fillna(df.groupby('age_group')['mean_working'].transform('median'))
+
+    # 나머지는 기존 전략 유지
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    df[num_cols] = df[num_cols].fillna(df[num_cols].median())
+
+    cat_cols = df.select_dtypes(exclude=[np.number]).columns
+    df[cat_cols] = df[cat_cols].fillna('Unknown')
+
+    return df.drop(columns=['age_group'])
+
+train_data = handle_missing_advanced(train_data)
+test_data = handle_missing_advanced(test_data)
+
+# 5. 이상치 처리 및 로그 변환 (요청 사항 반영)
+Q1 = train_data['stress_score'].quantile(0.25)
+Q3 = train_data['stress_score'].quantile(0.75)
+IQR = Q3 - Q1
+train_data['stress_score'] = train_data['stress_score'].clip(Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
+
+target_skew = skew(train_data['stress_score'])
+apply_log = abs(target_skew) > 0.5
+
+if apply_log:
+    train_data['stress_score'] = np.log1p(train_data['stress_score'])
+    print("✅ Log transformation applied.")
+
+# 6. AutoGluon 학습 (Stacking 강화 버전)
+# num_stack_levels를 사용하여 모델의 층을 깊게 쌓습니다.
+predictor = TabularPredictor(
+    label='stress_score',
+    eval_metric='mae'
+).fit(
+    train_data,
+    presets='best_quality',
+    num_stack_levels=2,  # 성능 향상을 위한 스태킹 레벨 증가
+    num_bag_folds=5,     # 5-폴드 교차 검증
+    time_limit=3600      # 1시간 학습
+)
+
+# 7. 예측 및 역변환
+predictions = predictor.predict(test_data)
+
+if apply_log:
+    predictions = np.expm1(predictions)
+
+# 결과 범위 보정 (0~1 사이)
+predictions = np.clip(predictions, 0, 1)
+
+# 8. 최종 Submission 파일 생성
+submission['stress_score'] = predictions
+submission.to_csv('submission3.csv', index=False)
+
+print("\n🚀 개선된 submission3.csv 생성이 완료되었습니다!")
+print(f"추가된 피처: BMI, MAP, Medical Multi-hot, Grouped Imputation")
